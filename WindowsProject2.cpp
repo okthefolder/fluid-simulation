@@ -8,48 +8,66 @@
 
 #define M_PI 3.14159
 
-struct vec2 {
-    float x;
-    float y;
-    float dx;
-    float dy;
+struct vec3 {
+    float x, y, z;
+    float dx, dy, dz;
+    float g_dy;
     float density;
     float pressure;
 };
 
 // Global variables
 HBITMAP hBitmap = NULL;
-const int bitmapWidth = 800; // Width of the buffer
+const int bitmapWidth = 600; // Width of the buffer
 const int bitmapHeight = 600; // Height of the buffer
+const int bitmapDepth = 600;
 
 const int particleBoxSizeX = 20;
 const int particleBoxSizeY = 20;
-const int numberOfBoxes = (bitmapHeight / particleBoxSizeY) * (bitmapWidth / particleBoxSizeX);
+const int particleBoxSizeZ = 20;
+const int numberOfBoxes = (bitmapHeight / particleBoxSizeY) * (bitmapWidth / particleBoxSizeX) * (bitmapWidth / particleBoxSizeZ);
+const int groundY = bitmapHeight;
 
-std::vector<vec2> particles[numberOfBoxes];
+const float H = 50;
+
+// Camera position and orientation
+float cameraX = bitmapWidth / 2.0f;
+float cameraY = -bitmapHeight * 2.0f; // Higher than the scene
+float cameraZ = bitmapHeight / 0.5f;
+
+// Rotation angle (45 degrees in radians)
+float yAngle = 0.0f * M_PI / 180.0f;
+float angle = 45.0f * M_PI / 180.0f;
+
+std::vector<vec3> particles[numberOfBoxes];
+
+std::vector<float> kernelTable;
+std::vector<float> dWdrTable;
 
 void generate_particles() {
-    for (int i = 0; i < 10000; i++) {
-        int r1 = rand() % 800;
-        int r2 = rand() % 600;
-        vec2 vec = { static_cast<float>(r1), static_cast<float>(r2) };
+    for (int i = 0; i < 1000; i++) {
+        int r1 = bitmapWidth / 3 + rand() % bitmapWidth/30;
+        int r2 = bitmapHeight / 3 + rand() % bitmapHeight/30;
+        int r3 = bitmapDepth / 3 + rand() % bitmapDepth/30;
+        vec3 vec = { static_cast<float>(r1), static_cast<float>(r2), static_cast<float>(r3) };
         int R1 = r1 / particleBoxSizeX;
         int R2 = r2 / particleBoxSizeY;
-        int index = R1 + R2 * (bitmapHeight / particleBoxSizeX);
+        int R3 = r3 / particleBoxSizeZ;
+        int index = R1 + R2 * (bitmapWidth / particleBoxSizeX) + R3 * (bitmapWidth / particleBoxSizeZ);
         particles[index].push_back(vec);
     }
 }
 
-float r(vec2 p1, vec2 p2) {
-    return pow(p1.x - p2.x, 2)+pow(p1.y-p2.y,2);
+float r(vec3 p1, vec3 p2) {
+    return pow(p1.x - p2.x, 2) + pow(p1.y - p2.y, 2) + pow(p1.z - p2.z, 2);
 }
 
 float W(float r, float h) {
     if (r < h / 2) {
-        return ((8 / (M_PI * pow(h, 2))) * (1 - 6 * pow(r / h, 2) + 6 * pow(r / h, 3)));
+        return ((8 / (M_PI * pow(h, 3))) * (1 - 6 * pow(r / h, 2) + 6 * pow(r / h, 3)));
     }
     else if (r < h) {
-        return (8 / (M_PI * pow(h, 2))) * 2 * pow(1 - r / h, 3);
+        return (8 / (M_PI * pow(h, 3))) * 2 * pow(1 - r / h, 3);
     }
     else {
         return 0;
@@ -58,52 +76,73 @@ float W(float r, float h) {
 
 float dW_dr(float r, float h) {
     if (r < h / 2) {
-        return (8 / (M_PI * pow(h, 3))) * (-12 * r / h + 18 * pow(r, 2) / pow(h, 2));
+        return (8 / (M_PI * pow(h, 4))) * (-12 * r / h + 18 * pow(r, 2) / pow(h, 2));
     }
     else if (r < h) {
-        return (8 / (M_PI * pow(h, 3))) * (-6 * pow(1 - r / h, 2) / h);
+        return (8 / (M_PI * pow(h, 4))) * (-6 * pow(1 - r / h, 2) / h);
     }
     else {
         return 0;
     }
 }
 
-vec2 gradW(vec2 p1, vec2 p2, float h) {
-    vec2 r = { p1.x - p2.x, p1.y - p2.y };
-    float r_magnitude = sqrt(r.x * r.x + r.y * r.y);
-    if (r_magnitude == 0) return { 0, 0 }; // Avoid division by zero
-    float dWdr = dW_dr(r_magnitude, h);
-    return { dWdr * (r.x / r_magnitude), dWdr * (r.y / r_magnitude) };
+void initializeKernelTables(float h, int resolution) {
+    kernelTable.resize(resolution);
+    dWdrTable.resize(resolution);
+
+    float stepSize = h / resolution;
+    for (int i = 0; i < resolution; ++i) {
+        float r = i * stepSize;
+        kernelTable[i] = W(r, h);
+        dWdrTable[i] = dW_dr(r, h);
+    }
+}
+
+float W_lookup(float r, float h) {
+    int index = static_cast<int>(r / h * kernelTable.size());
+    index = max(0, min(index, static_cast<int>(kernelTable.size()) - 1));
+    return kernelTable[index];
+}
+
+float dWdr_lookup(float r, float h) {
+    int index = static_cast<int>(r / h * dWdrTable.size());
+    index = max(0, min(index, static_cast<int>(dWdrTable.size()) - 1));
+    return dWdrTable[index];
+}
+
+vec3 gradW(vec3 p1, vec3 p2, float h) {
+    vec3 r = { p1.x - p2.x, p1.y - p2.y, p1.z - p2.z };
+    float r_magnitude = sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+    if (r_magnitude == 0) return { 0, 0, 0 };
+    float dWdr = dWdr_lookup(r_magnitude, h);
+    return { dWdr * (r.x / r_magnitude), dWdr * (r.y / r_magnitude), dWdr * (r.z / r_magnitude) };
 }
 
 void update_density() {
-    
     for (int j = 0; j < numberOfBoxes; j++) {
         for (size_t i = 0; i < particles[j].size(); ++i) {
-            vec2& p = particles[j][i];
+            vec3& p = particles[j][i];
             p.density = 0;
-            for (int offsetY = -1; offsetY <= 1; ++offsetY) {
-                for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-                    // Calculate neighboring box indices
-                    int neighborX = (j % (bitmapWidth / particleBoxSizeX)) + offsetX;
-                    int neighborY = (j / (bitmapWidth / particleBoxSizeX)) + offsetY;
+            for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+                for (int offsetY = -1; offsetY <= 1; ++offsetY) {
+                    for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+                        int neighborX = (j % (bitmapWidth / particleBoxSizeX)) + offsetX;
+                        int neighborY = ((j / (bitmapWidth / particleBoxSizeX)) % (bitmapHeight / particleBoxSizeY)) + offsetY;
+                        int neighborZ = (j / (bitmapWidth / particleBoxSizeX) / (bitmapHeight / particleBoxSizeY)) + offsetZ;
 
-                    // Check if the neighboring box indices are within bounds
-                    if (neighborX >= 0 && neighborX < (bitmapWidth / particleBoxSizeX) &&
-                        neighborY >= 0 && neighborY < (bitmapHeight / particleBoxSizeY)) {
-                        int neighborIndex = neighborX + neighborY * (bitmapWidth / particleBoxSizeX);
+                        if (neighborX >= 0 && neighborX < (bitmapWidth / particleBoxSizeX) &&
+                            neighborY >= 0 && neighborY < (bitmapHeight / particleBoxSizeY) &&
+                            neighborZ >= 0 && neighborZ < (bitmapWidth / particleBoxSizeZ)) {
+                            int neighborIndex = neighborX + neighborY * (bitmapWidth / particleBoxSizeX) + neighborZ * (bitmapWidth / particleBoxSizeZ);
 
-                        // Iterate over particles in the neighboring box
-                        for (size_t k = 0; k < particles[neighborIndex].size(); ++k) {
-                            // Reference to neighboring particle
-                            const vec2& p2 = particles[neighborIndex][k];
-                            //std::cout << W(1, 5) << std::endl;
-                            p.density += W(r(p, p2), 20);
+                            for (size_t k = 0; k < particles[neighborIndex].size(); ++k) {
+                                const vec3& p2 = particles[neighborIndex][k];
+                                p.density += W_lookup(r(p, p2), H);
+                            }
                         }
                     }
                 }
             }
-            //std::cout << p.density << std::endl;
         }
     }
 }
@@ -111,33 +150,38 @@ void update_density() {
 void update_pressure() {
     for (int j = 0; j < numberOfBoxes; j++) {
         for (size_t i = 0; i < particles[j].size(); ++i) {
-            vec2& p_i = particles[j][i];
-            vec2 force = { 0, 0 };
-            for (int offsetY = -1; offsetY <= 1; ++offsetY) {
-                for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-                    int neighborX = (j % (bitmapWidth / particleBoxSizeX)) + offsetX;
-                    int neighborY = (j / (bitmapWidth / particleBoxSizeX)) + offsetY;
+            vec3& p_i = particles[j][i];
+            vec3 force = { 0, 0, 0 };
+            for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+                for (int offsetY = -1; offsetY <= 1; ++offsetY) {
+                    for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+                        int neighborX = (j % (bitmapWidth / particleBoxSizeX)) + offsetX;
+                        int neighborY = ((j / (bitmapWidth / particleBoxSizeX)) % (bitmapHeight / particleBoxSizeY)) + offsetY;
+                        int neighborZ = (j / (bitmapWidth / particleBoxSizeX) / (bitmapHeight / particleBoxSizeY)) + offsetZ;
 
-                    if (neighborX >= 0 && neighborX < (bitmapWidth / particleBoxSizeX) &&
-                        neighborY >= 0 && neighborY < (bitmapHeight / particleBoxSizeY)) {
-                        int neighborIndex = neighborX + neighborY * (bitmapWidth / particleBoxSizeX);
+                        if (neighborX >= 0 && neighborX < (bitmapWidth / particleBoxSizeX) &&
+                            neighborY >= 0 && neighborY < (bitmapHeight / particleBoxSizeY) &&
+                            neighborZ >= 0 && neighborZ < (bitmapWidth / particleBoxSizeZ)) {
+                            int neighborIndex = neighborX + neighborY * (bitmapWidth / particleBoxSizeX) + neighborZ * (bitmapWidth / particleBoxSizeZ);
 
-                        for (size_t k = 0; k < particles[neighborIndex].size(); ++k) {
-                            const vec2& p_j = particles[neighborIndex][k];
-                            float pressure_i = p_i.density-1;
-                            float pressure_j = p_j.density-1;
-                            float density_j = p_j.density;
+                            for (size_t k = 0; k < particles[neighborIndex].size(); ++k) {
+                                const vec3& p_j = particles[neighborIndex][k];
+                                float pressure_i = p_i.density - 3;
+                                float pressure_j = p_j.density - 3;
+                                float density_j = p_j.density;
 
-                            vec2 gradW_ij = gradW(p_i, p_j, 20);
-                            force.x += (pressure_i + pressure_j) / (2.0f * density_j) * gradW_ij.x;
-                            force.y += (pressure_i + pressure_j) / (2.0f * density_j) * gradW_ij.y;
+                                vec3 gradW_ij = gradW(p_i, p_j, H);
+                                force.x += (pressure_i + pressure_j) / (2.0f * density_j) * gradW_ij.x;
+                                force.y += (pressure_i + pressure_j) / (2.0f * density_j) * gradW_ij.y;
+                                force.z += (pressure_i + pressure_j) / (2.0f * density_j) * gradW_ij.z;
+                            }
                         }
                     }
                 }
             }
-            p_i.dx = force.x;
-            p_i.dy = force.y;
-            //std::cout << p_i.dx << " " << p_i.dy << std::endl;
+            p_i.dx = 5 * force.x;
+            p_i.dy = 5 * (force.y);
+            p_i.dz = 5 * force.z;
         }
     }
 }
@@ -145,48 +189,38 @@ void update_pressure() {
 void update_particles() {
     update_density();
     update_pressure();
-    // Create a temporary vector to store updated particles
-    //std::vector<std::vector<vec2>> updatedParticles(numberOfBoxes);
 
-    // Iterate over particles in each box
-
-    std::vector<std::vector<vec2>> updatedParticles(numberOfBoxes);
+    std::vector<std::vector<vec3>> updatedParticles(numberOfBoxes);
 
     for (int j = 0; j < numberOfBoxes; j++) {
         for (size_t i = 0; i < particles[j].size(); ++i) {
-            vec2& p1 = particles[j][i];
+            vec3& p1 = particles[j][i];
             p1.x += p1.dx * 1;
             p1.y += p1.dy * 1;
-            
+            p1.z += p1.dz * 1;
+
             if (p1.x < 0) p1.x = 0;
             if (p1.x >= bitmapWidth) p1.x = bitmapWidth - 1;
             if (p1.y < 0) p1.y = 0;
-            if (p1.y >= bitmapHeight) p1.y = bitmapHeight - 1;
+            if (p1.y >= groundY) {
+                p1.y = groundY - 1;
+                p1.g_dy = 0;
+            }
+            if (p1.z < 0) p1.z = 0;
+            if (p1.z >= bitmapDepth) p1.z = bitmapDepth - 1;
 
             int R1 = p1.x / particleBoxSizeX;
             int R2 = p1.y / particleBoxSizeY;
-            int index = R1 + R2 * (bitmapWidth / particleBoxSizeX);
-            //std::cout << R2-p1.y/20 << std::endl;
+            int R3 = p1.z / particleBoxSizeZ;
+            int index = R1 + R2 * (bitmapWidth / particleBoxSizeX) + R3 * (bitmapWidth / particleBoxSizeZ);
             updatedParticles[index].push_back(p1);
         }
     }
     for (int j = 0; j < numberOfBoxes; j++) {
-        // Copy the vector of particles from updatedParticles to particles
         particles[j] = updatedParticles[j];
-    }
-
-    for (int j = 0; j < numberOfBoxes; j++) {
-        for (size_t i = 0; i < particles[j].size(); ++i) {
-            vec2 p = particles[j][i];
-            if (abs(p.x / 20 - j % 40) >= 1 || abs(p.y / 20-j/40) >=1) {
-                std::cout << ":( "<<j << std::endl;
-            }
-        }
     }
 }
 
-
-// Function to draw onto the buffer
 void draw_buffer(HDC hdcBuffer) {
     // Create a BITMAPINFO structure to describe the bitmap format
     BITMAPINFO bmi = {};
@@ -203,29 +237,56 @@ void draw_buffer(HDC hdcBuffer) {
     // Clear the buffer to white
     memset(buffer, 255, bitmapWidth * bitmapHeight * 3); // White color (RGB: 255, 255, 255)
 
+    // Perspective projection parameters
+    float fov = 90.0f; // Field of view in degrees
+    float aspectRatio = static_cast<float>(bitmapWidth) / static_cast<float>(bitmapHeight);
+    float nearPlane = 300.0f; // Distance to the nar plane
+    float scale = tan(fov * 0.5 * M_PI / 180.0) * nearPlane;
+
+
+    float cosAngle = cos(angle);
+    float sinAngle = sin(angle);
+
+
+
+    // Fixed depth range for z axis
+    float minZ = 0.0f;
+    float maxZ = bitmapHeight;
+
     // Draw particles onto the buffer
-    for (int i = 0; i < numberOfBoxes; i++) {
-        std::vector<vec2>& boxParticles = particles[i];
-        if (boxParticles.size() != 0){
-            //std::cout << boxParticles[0].density << std::endl;
-        }
-        for (const vec2& p : boxParticles) {
-            // Calculate the offset of the current pixel in the buffer
-            int x = static_cast<int>(p.x);
-            int y = static_cast<int>(p.y);
-            //std::cout << p.density<<std::endl;
+    for (int i = 0; i < numberOfBoxes; ++i) {
+        for (size_t j = 0; j < particles[i].size(); ++j) {
+            vec3& p = particles[i][j];
 
-            // Check if particle is within buffer bounds
-            if (x >= 0 && x < bitmapWidth && y >= 0 && y < bitmapHeight) {
-                int offset = (y * bitmapWidth + x) * 3; // 3 bytes per pixel
+            // Translate particle position to camera space
+            float relX = p.x - cameraX;
+            float relY = p.y - cameraY;
+            float relZ = p.z - cameraZ;
 
-                // Set pixel color to black at particle coordinates
-                buffer[offset] = 0;  // Blue component
-                buffer[offset + 1] = 0; // Green component
-                vec2 R = { p.dx * pow(10,5), p.dy * pow(10,5) };
-                vec2 O = { 0,0 };
-                //std::cout << r(R, O) << std::endl;
-                buffer[offset + 2] = r(R, O); ; // Red component
+            // Apply rotation around X-axis to simulate a 45-degree view
+            float yRotated = relY * cosAngle - relZ * sinAngle;
+            float zRotated = relY * sinAngle + relZ * cosAngle;
+
+            float xRotated = relX * cos(yAngle) + zRotated * sin(yAngle);
+            float zRotatedY = -relX * sin(yAngle) + zRotated * cos(yAngle);
+
+            // Perspective projection transformation
+            if (yRotated != 0) { // Prevent division by zero
+                float xProjected = (relX / yRotated) * scale * aspectRatio + bitmapWidth / 2.0f;
+                float zProjected = (zRotated / yRotated) * scale + bitmapHeight / 2.0f;
+
+                // Normalize zProjected to fit within the depth range
+                float zNormalized = (p.z - minZ) / (maxZ - minZ);
+
+                // Check if particle is within buffer bounds
+                if (xProjected >= 0 && xProjected < bitmapWidth && zProjected >= 0 && zProjected < bitmapHeight) {
+                    int offset = (static_cast<int>(zProjected) * bitmapWidth + static_cast<int>(xProjected)) * 3; // 3 bytes per pixel
+
+                    // Set pixel color to black at particle coordinates
+                    buffer[offset] = 0;       // Blue component
+                    buffer[offset + 1] = 0;   // Green component
+                    buffer[offset + 2] = static_cast<BYTE>(255 * zNormalized); // Red component (depth-based coloring)
+                }
             }
         }
     }
@@ -237,12 +298,10 @@ void draw_buffer(HDC hdcBuffer) {
     delete[] buffer;
 }
 
-// Window procedure
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_CREATE:
     {
-        // Create a compatible bitmap for drawing
         HDC hdc = GetDC(hwnd);
         hBitmap = CreateCompatibleBitmap(hdc, bitmapWidth, bitmapHeight);
         ReleaseDC(hwnd, hdc);
@@ -253,11 +312,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
 
-        // Draw the buffer onto the window
         HDC hdcBuffer = CreateCompatibleDC(hdc);
         SelectObject(hdcBuffer, hBitmap);
-        draw_buffer(hdcBuffer); // Draw onto the buffer
-        BitBlt(hdc, 0, 0, bitmapWidth, bitmapHeight, hdcBuffer, 0, 0, SRCCOPY); // Transfer buffer to window
+        draw_buffer(hdcBuffer);
+        BitBlt(hdc, 0, 0, bitmapWidth, bitmapHeight, hdcBuffer, 0, 0, SRCCOPY);
         DeleteDC(hdcBuffer);
 
         EndPaint(hwnd, &ps);
@@ -274,18 +332,21 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     return 0;
 }
 
-// WinMain function
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine, int nCmdShow) {
     AllocConsole();
-    // Redirect standard input and output to the console window
     FILE* pConsoleIn, * pConsoleOut;
     freopen_s(&pConsoleIn, "CONIN$", "r", stdin);
     freopen_s(&pConsoleOut, "CONOUT$", "w", stdout);
     freopen_s(&pConsoleOut, "CONOUT$", "w", stderr);
     std::srand(static_cast<unsigned int>(std::time(nullptr)));
-    generate_particles();
 
-    // Register window class
+    std::cout << "hi1" << std::endl;
+    generate_particles();
+    std::cout << "hi1" << std::endl;
+
+    initializeKernelTables(20, 1000);
+    std::cout << "hi1" << std::endl;
+
     const wchar_t CLASS_NAME[] = L"SampleWindowClass";
 
     WNDCLASS wc = {};
@@ -295,13 +356,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
 
     RegisterClass(&wc);
 
-    // Create window
     HWND hwnd = CreateWindowEx(
         0,
         CLASS_NAME,
         L"My Window",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
+        CW_USEDEFAULT, CW_USEDEFAULT, bitmapWidth, bitmapHeight,
         NULL, NULL, hInstance, NULL
     );
 
@@ -310,8 +370,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
 
     ShowWindow(hwnd, nCmdShow);
 
-    // Message loop
     MSG msg = {};
+    //Sleep(8000);
     while (true) {
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT)
@@ -321,8 +381,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine,
         }
         std::cout << "hi" << std::endl;
         update_particles();
-        InvalidateRect(hwnd, NULL, TRUE); // Invalidate the entire window
-        UpdateWindow(hwnd); // Force the window to redraw
+        InvalidateRect(hwnd, NULL, TRUE);
+        UpdateWindow(hwnd);
     }
 
     return 0;
